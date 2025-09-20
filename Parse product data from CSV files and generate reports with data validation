@@ -1,0 +1,228 @@
+"""
+product_csv_parser.py
+
+A single-file Python tool to:
+ - Parse one or more product CSV files (or a folder)
+ - Run validation checks (required columns, types, missing values, duplicates,
+   price/stock sanity, SKU uniqueness, date formats)
+ - Produce human-friendly reports:
+     * Excel workbook with multiple sheets (summary, cleaned_data, anomalies, stats)
+     * CSV of cleaned/normalized data
+     * Simple PNG charts (category breakdown, price distribution)
+ - Exit code and log messages indicate pass/fail of validation rules
+
+Usage:
+    python product_csv_parser.py --input products.csv
+    python product_csv_parser.py --input-folder ./csvs --output reports/
+
+Dependencies:
+    pandas, openpyxl, matplotlib
+    pip install pandas openpyxl matplotlib
+
+Notes:
+ - The script is conservative: it doesn't overwrite input files. Outputs are written
+   into the output folder (default: ./reports_{timestamp}).
+ - Customize REQUIRED_COLUMNS at top to match your CSV schema.
+
+"""
+
+from __future__ import annotations
+import argparse
+import sys
+import os
+import pathlib
+import logging
+from datetime import datetime
+from typing import List, Dict, Any, Tuple
+
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# --------------------------- Configuration ----------------------------------
+REQUIRED_COLUMNS = [
+    "product_id",  # unique product identifier
+    "name",
+    "category",
+    "price",
+    "currency",
+    "stock",       # integer quantity on hand
+    "sku",
+]
+
+# Columns that may exist but are optional
+OPTIONAL_COLUMNS = ["description", "launch_date", "image_urls", "vendor"]
+
+# Validation thresholds / rules
+MAX_REASONABLE_PRICE = 1_000_000  # currency units
+MAX_REASONABLE_STOCK = 1_000_000
+
+# ---------------------------------------------------------------------------
+
+log = logging.getLogger("product_csv_parser")
+
+
+def setup_logging(level=logging.INFO):
+    handler = logging.StreamHandler()
+    fmt = "%(asctime)s %(levelname)s: %(message)s"
+    handler.setFormatter(logging.Formatter(fmt))
+    log.addHandler(handler)
+    log.setLevel(level)
+
+
+def find_input_files(input_path: str = None, input_folder: str = None) -> List[pathlib.Path]:
+    files: List[pathlib.Path] = []
+    if input_path:
+        p = pathlib.Path(input_path)
+        if p.exists() and p.is_file():
+            files.append(p)
+        else:
+            raise FileNotFoundError(f"Input file not found: {input_path}")
+    if input_folder:
+        folder = pathlib.Path(input_folder)
+        if not folder.exists() or not folder.is_dir():
+            raise FileNotFoundError(f"Input folder not found: {input_folder}")
+        for f in folder.iterdir():
+            if f.suffix.lower() in {".csv", ".tsv"} and f.is_file():
+                files.append(f)
+    if not files:
+        raise FileNotFoundError("No input CSV files found. Provide --input or --input-folder")
+    return files
+
+
+def read_csv_file(path: pathlib.Path) -> pd.DataFrame:
+    # Try common encodings/sep automatically
+    try:
+        df = pd.read_csv(path)
+        log.info(f"Loaded {len(df):,} rows from {path}")
+        return df
+    except Exception as e:
+        # Try alternate delimiter
+        try:
+            df = pd.read_csv(path, sep=";")
+            log.info(f"Loaded {len(df):,} rows from {path} using ';' delimiter")
+            return df
+        except Exception:
+            log.exception(f"Failed to read CSV: {path}")
+            raise e
+
+
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Lowercase column names and strip whitespace for tolerance
+    df = df.copy()
+    rename_map = {c: c.strip().lower().replace(" ", "_") for c in df.columns}
+    df.rename(columns=rename_map, inplace=True)
+    return df
+
+
+# --------------------------- Validation -----------------------------------
+
+class ValidationResult:
+    def __init__(self):
+        self.errors: List[str] = []
+        self.warnings: List[str] = []
+        self.row_level_issues: List[Dict[str, Any]] = []  # each dict: {'row': i, 'issues': [...]}
+
+    def add_error(self, msg: str):
+        self.errors.append(msg)
+        log.error(msg)
+
+    def add_warning(self, msg: str):
+        self.warnings.append(msg)
+        log.warning(msg)
+
+    def add_row_issue(self, row_index: int, issues: List[str]):
+        self.row_level_issues.append({"row": int(row_index), "issues": issues})
+
+    @property
+    def ok(self) -> bool:
+        return not self.errors
+
+
+def validate_dataframe(df: pd.DataFrame) -> ValidationResult:
+    res = ValidationResult()
+
+    # Required column check
+    for col in REQUIRED_COLUMNS:
+        if col not in df.columns:
+            res.add_error(f"Missing required column: '{col}'")
+
+    if not res.ok:
+        return res
+
+    # Check duplicates on unique id or SKU
+    if df["product_id"].duplicated().any():
+        dups = df[df["product_id"].duplicated(keep=False)]["product_id"].unique()
+        res.add_warning(f"Duplicate product_id values found: {len(dups)} unique duplicated ids")
+
+    if df["sku"].duplicated().any():
+        res.add_warning("Duplicate SKUs found")
+
+    # Data type and value checks per row
+    for i, row in df.iterrows():
+        issues: List[str] = []
+        # price
+        try:
+            price = float(row.get("price", float("nan")))
+            if price < 0:
+                issues.append("price_negative")
+            if price > MAX_REASONABLE_PRICE:
+                issues.append("price_unreasonably_high")
+        except Exception:
+            issues.append("price_not_numeric")
+
+        # stock
+        try:
+            stock = int(float(row.get("stock", 0)))
+            if stock < 0:
+                issues.append("stock_negative")
+            if stock > MAX_REASONABLE_STOCK:
+                issues.append("stock_unreasonably_high")
+        except Exception:
+            issues.append("stock_not_integer")
+
+        # category missing
+        if pd.isna(row.get("category")) or str(row.get("category")).strip() == "":
+            issues.append("category_missing")
+
+        # SKU missing
+        if pd.isna(row.get("sku")) or str(row.get("sku")).strip() == "":
+            issues.append("sku_missing")
+
+        # launch_date format check (optional)
+        ld = row.get("launch_date")
+        if pd.notna(ld):
+            try:
+                # try pandas parsing
+                _ = pd.to_datetime(ld)
+            except Exception:
+                issues.append("launch_date_bad_format")
+
+        if issues:
+            res.add_row_issue(i, issues)
+
+    return res
+
+
+# --------------------------- Reporting ------------------------------------
+
+def make_reports(df: pd.DataFrame, validation: ValidationResult, out_dir: pathlib.Path, base_name: str):
+    out_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    # Cleaned/normalized copy
+    cleaned = df.copy()
+
+    # Coerce types where possible
+    if "price" in cleaned.columns:
+        cleaned["price"] = pd.to_numeric(cleaned["price"], errors="coerce")
+    if "stock" in cleaned.columns:
+        cleaned["stock"] = pd.to_numeric(cleaned["stock"], errors="coerce").fillna(0).astype(int)
+
+    # Summary statistics
+    stats: Dict[str, Any] = {}
+    stats["total_products"] = len(cleaned)
+    if "price" in cleaned.columns:
+        stats["price_mean"] = float(cleaned["price"].dropna().mean() or 0)
+        stats["price_median"] = float(cleaned["price"].dropna().median() or 0)
+        stats["price_min"] = float(cleaned["price"].dropna().min() or 0)
+        stats["price_max"] = float(cleaned["price"].dropna().max() or 0)
